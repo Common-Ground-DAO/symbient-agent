@@ -1,0 +1,69 @@
+model:
+  provider: openai-api
+  default: gpt-5.6-luna
+
+_config_version: 33
+
+# Common Ground is deliberately a non-developer surface. The agent can
+# research and remember, but it cannot execute code, mutate files, browse as a
+# logged-in human, spawn subagents, or schedule autonomous work.
+platform_toolsets:
+  commonground: [web, memory, session_search, todo, clarify]
+
+agent:
+  max_turns: 15
+  gateway_timeout: 180
+  disabled_toolsets:
+    - terminal
+    - file
+    - browser
+    - code_execution
+    - delegation
+    - cronjob
+    - skills
+    - skills_hub
+
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: false
+  memory_char_limit: 6000
+  nudge_interval: 5
+  flush_min_turns: 4
+
+onboarding:
+  profile_build: off
+
+session_reset:
+  mode: idle
+  idle_minutes: 10080
+
+# The allowlisted Bot Lab participants are treated as one trusted team. This
+# gives the channel one continuous social memory instead of a private context
+# per participant. Do not combine this with public/untrusted access.
+group_sessions_per_user: false
+max_concurrent_sessions: 4
+
+streaming:
+  enabled: false
+
+skills:
+  creation_nudge_interval: 0
+
+platforms:
+  commonground:
+    enabled: true
+    reply_to_mode: first
+    gateway_restart_notification: false
+    typing_indicator: false

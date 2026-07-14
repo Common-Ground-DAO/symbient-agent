@@ -1,0 +1,20 @@
+services:
+  symbient-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: symbient-agent:local
+    container_name: symbient-agent
+    restart: unless-stopped
+    init: false
+    volumes:
+      - ${SYMBIENT_DATA_DIR:-/home/claude/.symbient-hermes}:/opt/data
+    environment:
+      HERMES_UID: ${HERMES_UID:-1000}
+      HERMES_GID: ${HERMES_GID:-1000}
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 4g
+    cpus: 2.0
+    command: ["gateway", "run"]
