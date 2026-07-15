@@ -64,6 +64,8 @@ skills:
 platforms:
   commonground:
     enabled: true
+    # Optional emergency restriction. Omit channel_ids to follow the bot's
+    # server-granted installations and roles dynamically.
     reply_to_mode: first
     gateway_restart_notification: false
     typing_indicator: false

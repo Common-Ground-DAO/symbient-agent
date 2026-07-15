@@ -26,6 +26,7 @@ def _message(
     message_id="message-1",
     creator_id="user-1",
     channel_id="channel-1",
+    community_id="community-1",
     content=None,
     parent_id=None,
     creator_is_bot=False,
@@ -37,6 +38,7 @@ def _message(
             "creatorId": creator_id,
             "creatorIsBot": creator_is_bot,
             "channelId": channel_id,
+            "communityId": community_id,
             "body": {
                 "version": "1",
                 "content": content
@@ -54,8 +56,6 @@ def adapter(monkeypatch):
     for key in (
         "COMMONGROUND_URL",
         "COMMONGROUND_BOT_TOKEN",
-        "COMMONGROUND_COMMUNITY_ID",
-        "COMMONGROUND_CHANNEL_IDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -67,12 +67,18 @@ def adapter(monkeypatch):
             token="test-token",
             extra={
                 "url": "https://cg.example.test",
-                "community_id": "community-1",
-                "channel_ids": ["channel-1"],
             },
         )
     )
     instance._bot_user_id = "bot-1"
+    instance._scopes = {
+        "channel-1": {
+            "communityId": "community-1",
+            "communityTitle": "First Community",
+            "channelId": "channel-1",
+            "channelTitle": "General",
+        }
+    }
     return instance
 
 
@@ -106,8 +112,6 @@ class TestConfiguration:
     def test_env_overrides_yaml(self, monkeypatch):
         monkeypatch.setenv("COMMONGROUND_URL", "https://env.example")
         monkeypatch.setenv("COMMONGROUND_BOT_TOKEN", "env-token")
-        monkeypatch.setenv("COMMONGROUND_COMMUNITY_ID", "env-community")
-        monkeypatch.setenv("COMMONGROUND_CHANNEL_IDS", "env-channel-1,env-channel-2")
 
         from gateway.config import PlatformConfig
 
@@ -117,17 +121,15 @@ class TestConfiguration:
                 token="yaml-token",
                 extra={
                     "url": "https://yaml.example",
-                    "community_id": "yaml-community",
-                    "channel_ids": ["yaml-channel"],
+                    "channel_ids": ["restricted-channel"],
                 },
             )
         )
         assert instance._base_url == "https://env.example"
         assert instance._token == "env-token"
-        assert instance._community_id == "env-community"
-        assert instance._channel_ids == {"env-channel-1", "env-channel-2"}
+        assert instance._allowed_channel_ids == {"restricted-channel"}
 
-    def test_validate_requires_token_community_and_channel(self, monkeypatch):
+    def test_validate_requires_only_token(self, monkeypatch):
         from gateway.config import PlatformConfig
 
         monkeypatch.delenv("COMMONGROUND_BOT_TOKEN", raising=False)
@@ -137,7 +139,7 @@ class TestConfiguration:
         config = PlatformConfig(
             enabled=True,
             token="token",
-            extra={"community_id": "community", "channel_ids": ["channel"]},
+            extra={},
         )
         assert validate_config(config) is True
 
@@ -202,6 +204,104 @@ class TestInboundRouting:
         await adapter._on_message_event(_message(message_id="m2", content=mention, creator_is_bot=True))
         await adapter._on_message_event(_message(message_id="m3", creator_id="bot-1", content=mention))
         adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_second_community_uses_event_scope(self, adapter):
+        adapter._scopes["channel-2"] = {
+            "communityId": "community-2",
+            "communityTitle": "Second Community",
+            "channelId": "channel-2",
+            "channelTitle": "General",
+        }
+        adapter.handle_message = AsyncMock()
+
+        await adapter._on_message_event(
+            _message(
+                message_id="message-2",
+                community_id="community-2",
+                channel_id="channel-2",
+                content=[{"type": "mention", "userId": "bot-1"}],
+            )
+        )
+
+        normalized = adapter.handle_message.await_args.args[0]
+        assert normalized.source.scope_id == "community-2"
+        assert normalized.source.chat_id == "channel-2"
+
+    @pytest.mark.asyncio
+    async def test_scope_refresh_replaces_routes(self, adapter):
+        adapter._api_post = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "communityId": "community-2",
+                        "communityTitle": "Second Community",
+                        "channelId": "channel-2",
+                        "channelTitle": "General",
+                    }
+                ],
+                "nextCursor": None,
+            }
+        )
+
+        await adapter._on_scopes_event({"action": "refresh", "data": {}})
+
+        assert set(adapter._scopes) == {"channel-2"}
+
+    @pytest.mark.asyncio
+    async def test_config_channel_restriction_filters_server_scopes(self, adapter):
+        adapter._allowed_channel_ids = {"channel-1"}
+        adapter._api_post = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "communityId": "community-2",
+                        "communityTitle": "Second Community",
+                        "channelId": "channel-2",
+                        "channelTitle": "General",
+                    }
+                ],
+                "nextCursor": None,
+            }
+        )
+
+        await adapter._refresh_scopes()
+
+        assert adapter._scopes == {}
+
+    @pytest.mark.asyncio
+    async def test_scope_refresh_follows_pagination(self, adapter):
+        adapter._api_post = AsyncMock(
+            side_effect=[
+                {
+                    "items": [
+                        {
+                            "communityId": "community-1",
+                            "communityTitle": "First Community",
+                            "channelId": "channel-1",
+                            "channelTitle": "General",
+                        }
+                    ],
+                    "nextCursor": "next-page",
+                },
+                {
+                    "items": [
+                        {
+                            "communityId": "community-2",
+                            "communityTitle": "Second Community",
+                            "channelId": "channel-2",
+                            "channelTitle": "General",
+                        }
+                    ],
+                    "nextCursor": None,
+                },
+            ]
+        )
+
+        await adapter._refresh_scopes()
+
+        assert set(adapter._scopes) == {"channel-1", "channel-2"}
+        assert adapter._api_post.await_args_list[1].args[1]["cursor"] == "next-page"
 
     @pytest.mark.asyncio
     async def test_duplicate_event_is_dispatched_once(self, adapter):
@@ -284,6 +384,17 @@ class TestOutboundApi:
         result = await adapter.send("channel-1", "response")
         assert result.success is False
         assert result.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_directory_lists_server_granted_scopes(self, adapter):
+        assert await adapter.get_channel_directory_entries() == [
+            {
+                "id": "channel-1",
+                "name": "General",
+                "type": "group",
+                "community": "First Community",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_api_rejects_non_ok_envelope(self, adapter):

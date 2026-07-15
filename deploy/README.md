@@ -9,7 +9,7 @@ credential store, and it exposes no inbound host port.
 
 - Common Ground Bot API v1 is the only community identity.
 - The adapter responds only to structured mentions and direct replies in the
-  configured channels.
+  channels granted by the bot's live Common Ground installations and roles.
 - Hermes' sender allowlist remains the final inbound authorization gate.
 - The configured tool surface is research, memory, session recall, planning,
   and clarification. Code execution and filesystem access are disabled.
@@ -20,7 +20,7 @@ credential store, and it exposes no inbound host port.
 
 1. Create a private data directory owned by the runtime UID.
 2. Copy `config.yaml`, `SOUL.md`, and `hermes.env.example` into it; rename the
-   last file to `.env` and fill in the secrets and UUID allowlists.
+   last file to `.env` and fill in the secrets and sender UUID allowlist.
 3. Set `.env` mode to `0600` and the directory mode to `0700`.
 4. Run `docker compose -f deploy/docker-compose.symbient.yml up -d --build`.
 

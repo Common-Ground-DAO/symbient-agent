@@ -1,7 +1,7 @@
 """Common Ground Bot API v1 platform adapter.
 
 The adapter deliberately uses only the bot principal's narrow API surface:
-``whoami``, ``messagesById``, ``createMessage``, and the authenticated
+``whoami``, scope discovery, ``messagesById``, ``createMessage``, and the authenticated
 ``cliMessageEvent`` Socket.IO stream. It does not create a human session or
 gain access to the rest of the Common Ground API.
 
@@ -117,14 +117,11 @@ class CommonGroundAdapter(BasePlatformAdapter):
             or extra.get("token")
             or ""
         ).strip()
-        self._community_id = str(
-            os.getenv("COMMONGROUND_COMMUNITY_ID")
-            or extra.get("community_id")
-            or ""
-        ).strip()
-        self._channel_ids = set(
-            _csv(os.getenv("COMMONGROUND_CHANNEL_IDS") or extra.get("channel_ids"))
+        self._allowed_channel_ids = set(
+            _csv(extra.get("channel_ids"))
         )
+        self._scopes: dict[str, dict[str, str]] = {}
+        self._scopes_lock = asyncio.Lock()
 
         self._http: httpx.AsyncClient | None = None
         self._socket: Any = None
@@ -134,6 +131,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._shutting_down = False
         self._disconnect_recovery_task: asyncio.Task[None] | None = None
+        self._event_stream_connected_once = False
 
     @property
     def name(self) -> str:
@@ -174,10 +172,10 @@ class CommonGroundAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        if not self._token or not self._community_id or not self._channel_ids:
+        if not self._token:
             self._set_fatal_error(
                 "config_missing",
-                "Common Ground token, community ID, and channel IDs are required",
+                "Common Ground bot token is required",
                 retryable=False,
             )
             return False
@@ -198,6 +196,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
             self._device_id = str(identity.get("deviceId") or "")
             if not self._bot_user_id or not self._device_id:
                 raise CommonGroundApiError("Common Ground returned an incomplete bot identity")
+            await self._refresh_scopes()
 
             try:
                 from gateway.status import acquire_scoped_lock
@@ -219,6 +218,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
             self._socket.on("disconnect", self._on_disconnect)
             self._socket.on("connect_error", self._on_connect_error)
             self._socket.on("cliMessageEvent", self._on_message_event)
+            self._socket.on("cliBotScopesEvent", self._on_scopes_event)
             await self._socket.connect(
                 self._base_url,
                 socketio_path=SOCKET_PATH,
@@ -227,9 +227,9 @@ class CommonGroundAdapter(BasePlatformAdapter):
             )
             self._mark_connected()
             logger.info(
-                "[Common Ground] authenticated as bot user %s for %d channel(s)",
+                "[Common Ground] authenticated as bot user %s with %d reachable channel(s)",
                 self._bot_user_id,
-                len(self._channel_ids),
+                len(self._scopes),
             )
             return True
         except Exception as exc:
@@ -243,6 +243,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._shutting_down = True
+        self._event_stream_connected_once = False
         recovery_task = self._disconnect_recovery_task
         if recovery_task is not None and recovery_task is not asyncio.current_task():
             recovery_task.cancel()
@@ -274,6 +275,12 @@ class CommonGroundAdapter(BasePlatformAdapter):
     async def _on_connect(self) -> None:
         if not self.is_connected:
             self._mark_connected()
+        if self._event_stream_connected_once:
+            try:
+                await self._refresh_scopes()
+            except CommonGroundApiError as exc:
+                logger.warning("[Common Ground] could not refresh scopes after reconnect: %s", exc)
+        self._event_stream_connected_once = True
         logger.info("[Common Ground] event stream connected")
 
     async def _on_disconnect(self, reason: Any = None) -> None:
@@ -317,12 +324,66 @@ class CommonGroundAdapter(BasePlatformAdapter):
             self._seen.popitem(last=False)
         return True
 
-    async def _message_by_id(self, channel_id: str, message_id: str) -> dict[str, Any] | None:
+    async def _refresh_scopes(self) -> None:
+        """Replace the routing table with the bot principal's current grants."""
+        async with self._scopes_lock:
+            scopes: dict[str, dict[str, str]] = {}
+            cursor: str | None = None
+            while True:
+                data = await self._api_post(
+                    "/api/bot/v1/scopes/list",
+                    {"cursor": cursor, "limit": 100},
+                )
+                if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                    raise CommonGroundApiError("Common Ground returned invalid bot scopes")
+                for item in data["items"]:
+                    if not isinstance(item, dict):
+                        continue
+                    community_id = str(item.get("communityId") or "")
+                    channel_id = str(item.get("channelId") or "")
+                    if (
+                        not community_id
+                        or not channel_id
+                        or (
+                            self._allowed_channel_ids
+                            and channel_id not in self._allowed_channel_ids
+                        )
+                    ):
+                        continue
+                    scopes[channel_id] = {
+                        "communityId": community_id,
+                        "communityTitle": str(item.get("communityTitle") or community_id),
+                        "channelId": channel_id,
+                        "channelTitle": str(item.get("channelTitle") or channel_id),
+                    }
+                next_cursor = data.get("nextCursor")
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    break
+                if next_cursor == cursor:
+                    raise CommonGroundApiError("Common Ground returned a repeated scope cursor")
+                cursor = next_cursor
+            self._scopes = scopes
+            logger.info("[Common Ground] refreshed %d reachable channel(s)", len(scopes))
+
+    async def _on_scopes_event(self, event: Any) -> None:
+        if not isinstance(event, dict) or event.get("action") != "refresh":
+            return
+        try:
+            await self._refresh_scopes()
+        except CommonGroundApiError as exc:
+            logger.warning("[Common Ground] could not refresh bot scopes: %s", exc)
+
+    async def _message_by_id(
+        self,
+        community_id: str,
+        channel_id: str,
+        message_id: str,
+    ) -> dict[str, Any] | None:
         data = await self._api_post(
             "/api/bot/v1/messages/messagesById",
             {
                 "access": {
-                    "communityId": self._community_id,
+                    "communityId": community_id,
                     "channelId": channel_id,
                 },
                 "messageIds": [message_id],
@@ -340,12 +401,15 @@ class CommonGroundAdapter(BasePlatformAdapter):
             return
 
         message_id = str(message.get("id") or "")
+        community_id = str(message.get("communityId") or "")
         channel_id = str(message.get("channelId") or "")
         creator_id = str(message.get("creatorId") or "")
         if (
             not message_id
+            or not community_id
             or not creator_id
-            or channel_id not in self._channel_ids
+            or channel_id not in self._scopes
+            or self._scopes[channel_id]["communityId"] != community_id
             or creator_id == self._bot_user_id
             or message.get("creatorIsBot") is True
             or not self._remember(message_id)
@@ -358,7 +422,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
         reply_to_bot = False
         if isinstance(parent_id, str) and parent_id:
             try:
-                parent = await self._message_by_id(channel_id, parent_id)
+                parent = await self._message_by_id(community_id, channel_id, parent_id)
                 reply_to_bot = parent is not None and parent.get("creatorId") == self._bot_user_id
             except CommonGroundApiError as exc:
                 logger.warning("[Common Ground] could not resolve reply target: %s", exc)
@@ -374,7 +438,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
             chat_type="group",
             user_id=creator_id,
             user_name=creator_id,
-            scope_id=self._community_id,
+            scope_id=community_id,
             message_id=message_id,
         )
         normalized = MessageEvent(
@@ -402,8 +466,9 @@ class CommonGroundAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if chat_id not in self._channel_ids:
-            return SendResult(success=False, error="Channel is not allowlisted")
+        scope = self._scopes.get(chat_id)
+        if scope is None:
+            return SendResult(success=False, error="Channel is not available to this bot")
         body = content[:MAX_MESSAGE_LENGTH].strip()
         if not body:
             return SendResult(success=False, error="Message is empty")
@@ -413,7 +478,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
                 {
                     "id": str(uuid.uuid4()),
                     "access": {
-                        "communityId": self._community_id,
+                        "communityId": scope["communityId"],
                         "channelId": chat_id,
                     },
                     "body": {
@@ -434,7 +499,26 @@ class CommonGroundAdapter(BasePlatformAdapter):
         """Common Ground Bot API v1 has no typing-indicator endpoint."""
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        return {"name": chat_id, "type": "group", "scope_id": self._community_id}
+        scope = self._scopes.get(chat_id)
+        if scope is None:
+            return {}
+        return {
+            "name": scope["channelTitle"],
+            "type": "group",
+            "scope_id": scope["communityId"],
+            "community": scope["communityTitle"],
+        }
+
+    async def get_channel_directory_entries(self) -> list[dict[str, str]]:
+        return [
+            {
+                "id": scope["channelId"],
+                "name": scope["channelTitle"],
+                "type": "group",
+                "community": scope["communityTitle"],
+            }
+            for scope in self._scopes.values()
+        ]
 
 
 def check_requirements() -> bool:
@@ -444,9 +528,7 @@ def check_requirements() -> bool:
 def validate_config(config: PlatformConfig) -> bool:
     extra = config.extra or {}
     token = os.getenv("COMMONGROUND_BOT_TOKEN") or config.token or extra.get("token")
-    community_id = os.getenv("COMMONGROUND_COMMUNITY_ID") or extra.get("community_id")
-    channels = os.getenv("COMMONGROUND_CHANNEL_IDS") or extra.get("channel_ids")
-    return bool(token and community_id and _csv(channels))
+    return bool(token)
 
 
 def is_connected(config: PlatformConfig) -> bool:
@@ -455,14 +537,10 @@ def is_connected(config: PlatformConfig) -> bool:
 
 def _env_enablement() -> dict[str, Any] | None:
     token = os.getenv("COMMONGROUND_BOT_TOKEN", "").strip()
-    community_id = os.getenv("COMMONGROUND_COMMUNITY_ID", "").strip()
-    channel_ids = _csv(os.getenv("COMMONGROUND_CHANNEL_IDS"))
-    if not token or not community_id or not channel_ids:
+    if not token:
         return None
     return {
         "url": os.getenv("COMMONGROUND_URL", DEFAULT_URL).strip() or DEFAULT_URL,
-        "community_id": community_id,
-        "channel_ids": channel_ids,
     }
 
 
@@ -476,8 +554,6 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=[
             "COMMONGROUND_BOT_TOKEN",
-            "COMMONGROUND_COMMUNITY_ID",
-            "COMMONGROUND_CHANNEL_IDS",
             "COMMONGROUND_ALLOWED_USERS",
         ],
         install_hint="Install Hermes with the messaging extra",

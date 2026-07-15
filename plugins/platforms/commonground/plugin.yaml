@@ -12,14 +12,6 @@ requires_env:
     description: "Common Ground bot token"
     prompt: "Bot token"
     password: true
-  - name: COMMONGROUND_COMMUNITY_ID
-    description: "Community UUID used for Bot API access checks"
-    prompt: "Community ID"
-    password: false
-  - name: COMMONGROUND_CHANNEL_IDS
-    description: "Comma-separated channel UUIDs in which the agent may respond"
-    prompt: "Allowed channel IDs"
-    password: false
   - name: COMMONGROUND_ALLOWED_USERS
     description: "Comma-separated Common Ground user UUIDs allowed to invoke the agent"
     prompt: "Allowed user IDs"

@@ -74,8 +74,6 @@ def main() -> None:
         "OPENAI_API_KEY": _required(openai, "OPENAI_API_KEY", args.openai_env),
         "COMMONGROUND_URL": _required(cg, "CG_URL", args.cg_env),
         "COMMONGROUND_BOT_TOKEN": _required(cg, "CG_BOT_TOKEN", args.cg_env),
-        "COMMONGROUND_COMMUNITY_ID": _required(cg, "CG_COMMUNITY_ID", args.cg_env),
-        "COMMONGROUND_CHANNEL_IDS": _required(cg, "CG_CHANNEL_ID", args.cg_env),
         "COMMONGROUND_HOME_CHANNEL": _required(cg, "CG_CHANNEL_ID", args.cg_env),
         "COMMONGROUND_ALLOWED_USERS": ",".join(allowed_users),
         "COMMONGROUND_ALLOW_ALL_USERS": "false",

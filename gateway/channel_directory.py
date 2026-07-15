@@ -125,8 +125,16 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
+            elif callable(getattr(adapter, "get_channel_directory_entries", None)):
+                platforms[getattr(platform, "value", str(platform))] = (
+                    await adapter.get_channel_directory_entries()
+                )
         except Exception as e:
-            logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
+            logger.warning(
+                "Channel directory: failed to build %s: %s",
+                getattr(platform, "value", str(platform)),
+                e,
+            )
 
     # Platforms that don't support direct channel enumeration get session-based
     # discovery automatically, but only for platforms connected in THIS gateway
