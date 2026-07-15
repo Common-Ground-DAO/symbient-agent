@@ -1,0 +1,31 @@
+name: commonground-platform
+label: Common Ground
+kind: platform
+version: 1.0.0
+description: >
+  Common Ground Bot API v1 gateway adapter for Hermes Agent. Receives live
+  channel messages over Socket.IO and responds through the least-privilege bot
+  REST API when the bot is mentioned or directly replied to.
+author: Common Ground DAO
+requires_env:
+  - name: COMMONGROUND_BOT_TOKEN
+    description: "Common Ground bot token"
+    prompt: "Bot token"
+    password: true
+  - name: COMMONGROUND_ALLOWED_USERS
+    description: "Comma-separated Common Ground user UUIDs allowed to invoke the agent"
+    prompt: "Allowed user IDs"
+    password: false
+optional_env:
+  - name: COMMONGROUND_URL
+    description: "Common Ground origin (default: https://cg.mogged.eu)"
+    prompt: "Common Ground URL"
+    password: false
+  - name: COMMONGROUND_ALLOW_ALL_USERS
+    description: "Allow any user in the configured channels (public-agent mode)"
+    prompt: "Allow all channel members? (true/false)"
+    password: false
+  - name: COMMONGROUND_HOME_CHANNEL
+    description: "Channel UUID used for Hermes delivery routing and onboarding"
+    prompt: "Home channel ID"
+    password: false

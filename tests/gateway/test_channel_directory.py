@@ -86,6 +86,24 @@ class TestBuildChannelDirectoryWrites:
 
 
 class TestBuildChannelDirectoryOffload:
+    def test_adapter_native_entries_replace_session_discovery(self, tmp_path):
+        cache_file = tmp_path / "channel_directory.json"
+
+        class NativeDirectoryAdapter:
+            async def get_channel_directory_entries(self):
+                return [{"id": "channel-1", "name": "General", "type": "group"}]
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._build_from_sessions") as session_builder:
+            directory = asyncio.run(
+                build_channel_directory({"commonground": NativeDirectoryAdapter()})
+            )
+
+        assert directory["platforms"]["commonground"] == [
+            {"id": "channel-1", "name": "General", "type": "group"}
+        ]
+        session_builder.assert_not_called()
+
     def test_discord_builder_runs_off_event_loop_thread(self, tmp_path):
         from gateway.config import Platform
 
