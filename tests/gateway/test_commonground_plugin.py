@@ -1,5 +1,7 @@
 """Tests for the Common Ground Bot API v1 platform plugin."""
 
+import asyncio
+
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -208,6 +210,47 @@ class TestInboundRouting:
         await adapter._on_message_event(event)
         await adapter._on_message_event(event)
         adapter.handle_message.assert_awaited_once()
+
+
+class TestConnectionRecovery:
+    @pytest.mark.asyncio
+    async def test_server_disconnect_queues_gateway_recovery(self, adapter):
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+        adapter._mark_connected()
+
+        await adapter._on_disconnect("server disconnect")
+        await adapter._disconnect_recovery_task
+
+        assert adapter.is_connected is False
+        assert adapter.fatal_error_code == "server_disconnect"
+        assert adapter.fatal_error_retryable is True
+        fatal_handler.assert_awaited_once_with(adapter)
+
+    @pytest.mark.asyncio
+    async def test_transport_disconnect_leaves_reconnect_to_socket_client(self, adapter):
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+        adapter._mark_connected()
+
+        await adapter._on_disconnect("transport error")
+        await asyncio.sleep(0)
+
+        assert adapter.is_connected is False
+        assert adapter.has_fatal_error is False
+        fatal_handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_intentional_disconnect_does_not_queue_recovery(self, adapter):
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+        adapter._shutting_down = True
+
+        await adapter._on_disconnect("server disconnect")
+        await asyncio.sleep(0)
+
+        assert adapter._disconnect_recovery_task is None
+        fatal_handler.assert_not_awaited()
 
 
 class TestOutboundApi:

@@ -132,6 +132,8 @@ class CommonGroundAdapter(BasePlatformAdapter):
         self._device_id = ""
         self._lock_key: str | None = None
         self._seen: OrderedDict[str, None] = OrderedDict()
+        self._shutting_down = False
+        self._disconnect_recovery_task: asyncio.Task[None] | None = None
 
     @property
     def name(self) -> str:
@@ -164,6 +166,7 @@ class CommonGroundAdapter(BasePlatformAdapter):
         return envelope.get("data")
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._shutting_down = False
         if socketio is None:
             self._set_fatal_error(
                 "dependency_missing",
@@ -239,6 +242,11 @@ class CommonGroundAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        self._shutting_down = True
+        recovery_task = self._disconnect_recovery_task
+        if recovery_task is not None and recovery_task is not asyncio.current_task():
+            recovery_task.cancel()
+        self._disconnect_recovery_task = None
         self._mark_disconnected()
         await self._cleanup_transport()
         self._seen.clear()
@@ -269,7 +277,34 @@ class CommonGroundAdapter(BasePlatformAdapter):
         logger.info("[Common Ground] event stream connected")
 
     async def _on_disconnect(self, reason: Any = None) -> None:
+        self._mark_disconnected()
         logger.warning("[Common Ground] event stream disconnected: %s", reason or "unknown")
+        # python-socketio automatically reconnects transport failures, but an
+        # explicit Socket.IO ``server disconnect`` is final by design. Hand
+        # that case to Hermes' platform retry supervisor after this event
+        # callback returns; notifying inline would re-enter socket teardown.
+        if (
+            not self._shutting_down
+            and str(reason or "").lower() == "server disconnect"
+            and (
+                self._disconnect_recovery_task is None
+                or self._disconnect_recovery_task.done()
+            )
+        ):
+            self._disconnect_recovery_task = asyncio.create_task(
+                self._recover_server_disconnect()
+            )
+
+    async def _recover_server_disconnect(self) -> None:
+        await asyncio.sleep(0)
+        if self._shutting_down:
+            return
+        self._set_fatal_error(
+            "server_disconnect",
+            "Common Ground closed the event stream",
+            retryable=True,
+        )
+        await self._notify_fatal_error()
 
     async def _on_connect_error(self, error: Any) -> None:
         logger.warning("[Common Ground] event stream connection error: %s", error)
