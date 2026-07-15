@@ -68,6 +68,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_RUNTIME_NONRETRYABLE_RECONNECT_GRACE = 2
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -4082,6 +4083,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "config": platform_config,
                     "attempts": 0,
                     "next_retry": time.monotonic(),
+                    # A rolling deployment can briefly return an auth-shaped
+                    # response while a previously healthy adapter reconnects.
+                    # Give runtime recoveries two bounded follow-up attempts;
+                    # cold-start credential failures remain immediately fatal.
+                    "nonretryable_reconnect_grace": (
+                        _RUNTIME_NONRETRYABLE_RECONNECT_GRACE
+                    ),
                 }
                 logger.info(
                     "%s queued for background reconnection",
@@ -7946,7 +7954,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Retryable failures (network/DNS blips) keep retrying at the backoff
         cap indefinitely — they self-heal once connectivity returns, so a
         transient outage never requires manual intervention. Non-retryable
-        failures (bad auth, etc.) drop out of the queue immediately. The
+        failures (bad auth, etc.) drop out of the queue immediately, except
+        that a previously healthy runtime adapter gets two bounded grace
+        attempts so rolling deployments cannot strand it on a transient
+        auth-shaped response. The
         circuit breaker (``_pause_failed_platform`` / ``/platform pause``)
         remains available for manual operator control via ``/platform list``
         and ``/platform resume <name>``, but is no longer triggered
@@ -8047,6 +8058,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                        grace_remaining = int(
+                            info.get("nonretryable_reconnect_grace", 0)
+                        )
+                        if grace_remaining > 0:
+                            backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
+                            info["attempts"] = attempt
+                            info["next_retry"] = time.monotonic() + backoff
+                            info["nonretryable_reconnect_grace"] = grace_remaining - 1
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="retrying",
+                                error_code=adapter.fatal_error_code,
+                                error_message=adapter.fatal_error_message,
+                            )
+                            logger.warning(
+                                "Reconnect %s: non-retryable error (%s), "
+                                "keeping runtime recovery queued for %d bounded "
+                                "grace attempt(s); next retry in %ds",
+                                platform.value,
+                                adapter.fatal_error_message,
+                                grace_remaining,
+                                backoff,
+                            )
+                            await _dispose_unused_adapter(adapter)
+                            continue
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="fatal",

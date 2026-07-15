@@ -361,6 +361,48 @@ class TestPlatformReconnectWatcher:
         assert Platform.TELEGRAM not in runner.adapters
 
     @pytest.mark.asyncio
+    async def test_runtime_reconnect_gets_bounded_nonretryable_grace(self):
+        """A runtime reconnect survives a transient auth-shaped failure."""
+        runner = _make_runner()
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic() - 1,
+            "nonretryable_reconnect_grace": 2,
+        }
+
+        fail_adapter = StubAdapter(
+            succeed=False, fatal_error="temporary unauthorized", fatal_retryable=False
+        )
+        fail_adapter.disconnect = AsyncMock()
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=fail_adapter):
+            async def run_one_iteration():
+                runner._running = True
+                call_count = 0
+
+                async def fake_sleep(n):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count > 1:
+                        runner._running = False
+                    await real_sleep(0)
+
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await runner._platform_reconnect_watcher()
+
+            await run_one_iteration()
+
+        info = runner._failed_platforms[Platform.TELEGRAM]
+        assert info["attempts"] == 1
+        assert info["nonretryable_reconnect_grace"] == 1
+        assert info["next_retry"] > time.monotonic()
+        fail_adapter.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_reconnect_retryable_stays_in_queue(self):
         """Retryable failures should remain in the queue with incremented attempts."""
         runner = _make_runner()
@@ -600,6 +642,12 @@ class TestRuntimeDisconnectQueuing:
 
         assert Platform.TELEGRAM in runner._failed_platforms
         assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
+        assert (
+            runner._failed_platforms[Platform.TELEGRAM][
+                "nonretryable_reconnect_grace"
+            ]
+            == 2
+        )
 
     @pytest.mark.asyncio
     async def test_retryable_runtime_error_reconnects_immediately(self):
